@@ -136,12 +136,63 @@ def _can_pip_install() -> bool:
         return False
 
 
+def _is_writable_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        test = os.path.join(path, f".__write_test__{os.getpid()}_{int(time.time())}")
+        with open(test, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test)
+        return True
+    except Exception:
+        return False
+
+
 def pydeps_dir() -> str:
-    d = os.path.join(app_data_dir(), "pydeps")
-    os.makedirs(d, exist_ok=True)
-    if d not in sys.path:
-        sys.path.insert(0, d)
-    return d
+    """Directory used for auto-installed Python dependencies.
+
+    IMPORTANT:
+    - Even in "portable" mode, the app directory may live in protected or sync-managed locations
+      (e.g., OneDrive Desktop) that can cause PermissionError/locks during pip installs.
+    - To keep the UX reliable, we default pydeps to a per-user writable location, and only fall
+      back to the portable data folder if needed.
+
+    Users can force portable pydeps by setting PODCAST_APP_PORTABLE_PYDEPS=1.
+    """
+    force_portable = os.environ.get("PODCAST_APP_PORTABLE_PYDEPS", "").strip() == "1"
+
+    # Preferred: per-user cache (more reliable than OneDrive Desktop/portable dirs)
+    local_base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
+    if local_base:
+        preferred = os.path.join(local_base, "PodcastTranscriberApp", "pydeps")
+    else:
+        preferred = os.path.join(os.path.expanduser("~"), ".podcast_chapter_app", "pydeps")
+
+    portable_candidate = os.path.join(app_data_dir(), "pydeps")
+
+    base = portable_candidate if force_portable else preferred
+    if not _is_writable_dir(base):
+        base = portable_candidate
+
+    os.makedirs(base, exist_ok=True)
+    if base not in sys.path:
+        sys.path.insert(0, base)
+    return base
+
+
+def _pydeps_active_site_dir() -> str:
+    """A stable, writable target directory for pip installs.
+
+    We avoid repeatedly overwriting the same files (which can trigger Windows file locks)
+    by using a versioned site directory.
+    """
+    root = pydeps_dir()
+    ver = f"py{sys.version_info.major}{sys.version_info.minor}"
+    site = os.path.join(root, f"site-{ver}")
+    os.makedirs(site, exist_ok=True)
+    if site not in sys.path:
+        sys.path.insert(0, site)
+    return site
 
 
 def _ensure_pip_available() -> None:
@@ -162,8 +213,10 @@ def _ensure_pip_available() -> None:
 def ensure_import(module_name: str, pip_name: Optional[str] = None) -> None:
     """Try importing a module; if missing, attempt an auto-install into app-local pydeps.
 
-    - In restricted runtimes (Pyodide/Emscripten), subprocess/pip isn't supported.
-    - In a real release, you should bundle dependencies; this is a best-effort fallback.
+    Hardening improvements:
+    - Uses a per-user writable pydeps location by default (avoids OneDrive/portable permission issues)
+    - Captures pip stdout/stderr so failures are actionable
+    - Prefers binary wheels first (avoids requiring build tools), then retries without that constraint
     """
     try:
         __import__(module_name)
@@ -176,7 +229,9 @@ def ensure_import(module_name: str, pip_name: Optional[str] = None) -> None:
 
     if IS_RESTRICTED_RUNTIME:
         raise ImportError(
-            f"Missing dependency: {module_name}.\n\n"
+            f"Missing dependency: {module_name}.
+
+"
             "This environment does not support installing packages (subprocess disabled). "
             "Run the app locally (desktop Python) or use a packaged portable release."
         )
@@ -184,27 +239,71 @@ def ensure_import(module_name: str, pip_name: Optional[str] = None) -> None:
     if not _can_pip_install():
         raise ImportError(f"Missing dependency: {module_name} (pip/ensurepip unavailable)")
 
-    target = pydeps_dir()
     _ensure_pip_available()
 
-    try:
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "--no-warn-script-location",
-                "--target",
-                target,
-                pip_name,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    def _run_pip(args: List[str]) -> None:
+        p = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-    except Exception as e:
-        raise ImportError(f"Failed to auto-install dependency {pip_name}: {e}")
+        if p.returncode != 0:
+            # Trim to keep dialogs readable
+            out = (p.stdout or "")[-4000:]
+            err = (p.stderr or "")[-4000:]
+            raise RuntimeError(f"pip failed (exit {p.returncode}).
+
+stdout:
+{out}
+
+stderr:
+{err}")
+
+    target = _pydeps_active_site_dir()
+
+    # 1) Prefer wheels to avoid build tool requirements
+    base_cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-warn-script-location",
+        "--target",
+        target,
+        pip_name,
+    ]
+
+    # Some packages (esp. on Windows) fail if pip tries to build from source.
+    wheel_first = base_cmd.copy()
+    wheel_first.insert(6, "--only-binary=:all:")
+
+    try:
+        _run_pip(wheel_first)
+    except Exception:
+        # 2) Retry allowing sdists (best-effort)
+        try:
+            _run_pip(base_cmd)
+        except Exception as e:
+            # Last-mile: explain common causes clearly.
+            hint = ""
+            if pip_name.lower() == "gpt4all" and sys.version_info >= (3, 12):
+                hint = (
+                    "
+
+Common cause on Windows: gpt4all may not provide a prebuilt wheel for your Python version. "
+                    "If so, pip will fail unless build tools are installed.
+"
+                    "Best fix for an indie release: bundle gpt4all inside the packaged app, or run dev with Python 3.11."
+                )
+            raise ImportError(f"Failed to auto-install dependency {pip_name}: {e}{hint}")
+
+    # Make sure the newly-installed target is importable
+    if target not in sys.path:
+        sys.path.insert(0, target)
 
     __import__(module_name)
 
@@ -2100,10 +2199,10 @@ class App(QWidget):
         self.chk_topic_embeddings = QCheckBox("Better topic detection (embeddings)")
         self.chk_topic_embeddings.setChecked(True)
         self.chk_topic_embeddings.setToolTip(
-            "Uses a small local semantic model (auto-downloads once) to improve chapter boundaries and titles.
-"
+            "Uses a small local semantic model (auto-downloads once) to improve chapter boundaries and titles.\n"
             "Note: This does NOT require silence detection."
         )
+
         chap_row.addWidget(self.chk_topic_embeddings)
 
         self.spn_target_chapters = QSpinBox()
@@ -2475,9 +2574,8 @@ class App(QWidget):
                 QMessageBox.information(
                     self,
                     "LLM Models",
-                    "Could not refresh model list (offline?). Keeping defaults.
+                    "Could not refresh model list (offline?). Keeping defaults.\n\nDetails: " + str(e)
 
-Details: " + str(e),
                 )
             self.status.setText("LLM model list unchanged")
         except Exception as e:
