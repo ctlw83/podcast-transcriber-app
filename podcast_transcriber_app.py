@@ -248,13 +248,13 @@ from faster_whisper import WhisperModel
 # the app falls back to the fast TF-IDF / embeddings heuristics.
 
 LOCAL_LLM_DEFAULT_MODELS = [
-    # IMPORTANT: GPT4All downloads by *exact filename*. If the filename casing
-    # does not match GPT4All's published model index, downloads can fail with
-    # HTTP 404. These defaults are known-good filenames from GPT4All's catalog.
-    # (Models are large; users can switch later.)
-    "Phi-3-mini-4k-instruct.Q4_0.gguf",          # ~2.2GB, very fast
+    # Curated to run on an "average" computer (CPU-only is fine):
+    # - Prefer <= ~4GB Q4 models
+    # - Avoid giant 7B/13B defaults
+    # NOTE: These filenames must match GPT4All's catalog exactly.
     "Llama-3.2-1B-Instruct-Q4_0.gguf",           # ~0.8GB, very light
-    "Llama-3.2-3B-Instruct-Q4_0.gguf",           # ~1.9GB, stronger
+    "Llama-3.2-3B-Instruct-Q4_0.gguf",           # ~1.9GB, solid
+    "Phi-3-mini-4k-instruct.Q4_0.gguf",          # ~2.2GB, very fast
 ]
 
 # Remote catalogs/manifests (override via env vars for your own hosted manifests)
@@ -606,7 +606,11 @@ def seconds_to_timestamp(sec: float) -> str:
 
 
 def detect_silence_boundaries_fraction(audio_path: str) -> List[float]:
-    """Return silence start times as fractions [0..1] of duration."""
+    """Return silence start times as fractions [0..1] of duration.
+
+    NOTE: Silence detection is optional and can be expensive on some machines.
+    This helper remains for future use but is not called during audio load.
+    """
     from pydub import AudioSegment, silence
 
     audio = AudioSegment.from_file(audio_path)
@@ -1470,11 +1474,13 @@ def parse_transcript_editor(text: str) -> List[dict]:
 class AudioLoadWorker(QThread):
     """Background audio analysis to avoid UI freezes.
 
-    Decodes once, then:
-    - computes a downsampled waveform for drawing
-    - detects silence boundaries (for snapping)
+    IMPORTANT UX/PERF CHANGE:
+    - Audio *loading* should feel instant.
+    - Waveform generation is done in the background.
+    - Silence detection is DISABLED by default because it can be slow.
 
-    This keeps large/long files from blocking the GUI thread.
+    If you want silence snapping later, re-enable it behind a user toggle and
+    compute it on demand (e.g., when user enables snapping).
     """
 
     progress = Signal(int)
@@ -1489,7 +1495,7 @@ class AudioLoadWorker(QThread):
 
     def run(self) -> None:
         try:
-            from pydub import AudioSegment, silence
+            from pydub import AudioSegment
 
             if self.ffmpeg_path:
                 AudioSegment.converter = self.ffmpeg_path
@@ -1517,18 +1523,11 @@ class AudioLoadWorker(QThread):
                 step = max(1, int(samples.size / max(1, target_points)))
                 wave = samples[::step].astype(np.float32)
 
-            self.progress.emit(60)
-
-            # Silence detection on the low-rate mono audio is much faster
-            self.status.emit("Detecting silence...")
-            sil = silence.detect_silence(
-                a,
-                min_silence_len=1200,
-                silence_thresh=a.dBFS - 16,
-            )
-            silence_points = [max(0.0, min(1.0, (s[0] / 1000.0) / dur_s)) for s in sil]
-
             self.progress.emit(100)
+
+            # Silence detection intentionally disabled (speed / UX).
+            silence_points: List[float] = []
+
             self.finished.emit(wave, dur_s, silence_points)
         except Exception as e:
             self.failed.emit(str(e))
@@ -2101,7 +2100,9 @@ class App(QWidget):
         self.chk_topic_embeddings = QCheckBox("Better topic detection (embeddings)")
         self.chk_topic_embeddings.setChecked(True)
         self.chk_topic_embeddings.setToolTip(
-            "Uses a small local semantic model (auto-downloads once) to improve chapter boundaries and titles."
+            "Uses a small local semantic model (auto-downloads once) to improve chapter boundaries and titles.
+"
+            "Note: This does NOT require silence detection."
         )
         chap_row.addWidget(self.chk_topic_embeddings)
 
@@ -2364,29 +2365,39 @@ class App(QWidget):
     # ------------------------------
 
     def refresh_llm_model_list(self, silent: bool = False, force_refresh: bool = False) -> None:
-        """Fetch GPT4All's model catalog and populate the dropdown with valid filenames.
+        """Fetch GPT4All's model catalog and populate the dropdown with *small* models.
 
-        This prevents HTTP 404 errors when upstream filenames/casing change.
-        If offline or the catalog format changes, we keep the built-in defaults.
+        UX goal: only show options that can run on an average computer.
+        - Prefer <= ~4GB Q4 models
+        - Prefer 1B-4B families
+        - Keep list short and friendly
+
+        If offline or catalog parsing fails, we keep the built-in defaults.
         """
         try:
             self.status.setText("Refreshing LLM model list...")
             cat = _download_json_cached(DEFAULT_GPT4ALL_CATALOG_URL, timeout=12, force_refresh=force_refresh)
+
+            # Collect candidate models from catalog
             items: List[str] = []
-            # GPT4All catalog is a list of dicts
+            meta: dict[str, dict] = {}
+
             if isinstance(cat, list):
                 for it in cat:
                     if not isinstance(it, dict):
                         continue
                     fn = (it.get("filename") or it.get("file") or "").strip()
-                    # Some entries contain 'url' only; derive filename if possible
                     if not fn:
                         u = (it.get("url") or "").strip()
                         if u:
                             fn = os.path.basename(u)
-                    if fn and fn.lower().endswith(".gguf"):
-                        items.append(fn)
-            # De-dupe while preserving order
+                    if not (fn and fn.lower().endswith(".gguf")):
+                        continue
+
+                    items.append(fn)
+                    meta[fn] = it
+
+            # De-dupe preserve order
             seen = set()
             clean: List[str] = []
             for x in items:
@@ -2394,31 +2405,81 @@ class App(QWidget):
                     continue
                 seen.add(x)
                 clean.append(x)
-            # Keep it reasonably sized (the catalog can be large)
-            if clean:
-                # Prefer our defaults first if present
-                preferred = [m for m in LOCAL_LLM_DEFAULT_MODELS if m in clean]
-                rest = [m for m in clean if m not in set(preferred)]
-                final = preferred + rest[:120]
 
-                cur = self.llm_model_select.currentText().strip() if hasattr(self, "llm_model_select") else ""
-                self.llm_model_select.blockSignals(True)
-                self.llm_model_select.clear()
-                self.llm_model_select.addItems(final)
-                self.llm_model_select.blockSignals(False)
+            def _looks_small_enough(name: str, it: dict) -> bool:
+                n = (name or "").lower()
+                # Heuristic: allow curated small families
+                allow_families = (
+                    "llama-3.2-1b" in n or
+                    "llama-3.2-3b" in n or
+                    "phi-3-mini" in n or
+                    "phi-3" in n and "mini" in n or
+                    "gemma-2-2b" in n or
+                    "qwen2.5-1.5b" in n or
+                    "qwen2.5-3b" in n
+                )
+                if not allow_families:
+                    return False
+                # Prefer Q4-ish quantizations for CPU
+                if "q4" not in n and "q4_0" not in n and "q4_k" not in n:
+                    return False
+                # If size is present in metadata, enforce <= 4.5GB
+                sz = it.get("filesize") or it.get("size") or it.get("file_size")
+                try:
+                    # Some catalogs store bytes
+                    if isinstance(sz, (int, float)):
+                        if float(sz) > 4.5 * 1024 * 1024 * 1024:
+                            return False
+                except Exception:
+                    pass
+                return True
 
-                # Restore selection if possible
-                if cur and cur in final:
-                    self.llm_model_select.setCurrentText(cur)
-                else:
-                    self.llm_model_select.setCurrentIndex(0)
-                self.llm_model_name = self.llm_model_select.currentText()
+            # Filter to small-friendly list
+            filtered: List[str] = []
+            for fn in clean:
+                it = meta.get(fn, {}) if isinstance(meta.get(fn, {}), dict) else {}
+                if _looks_small_enough(fn, it):
+                    filtered.append(fn)
 
-                self.status.setText("LLM model list updated")
+            # Ensure defaults always appear (even if catalog changes/offline)
+            for m in LOCAL_LLM_DEFAULT_MODELS:
+                if m not in filtered:
+                    filtered.insert(0, m)
+
+            # Final short list: keep it compact
+            # Order: defaults first, then a few additional small models
+            final: List[str] = []
+            for m in filtered:
+                if m not in final:
+                    final.append(m)
+                if len(final) >= 12:
+                    break
+
+            cur = self.llm_model_select.currentText().strip() if hasattr(self, "llm_model_select") else ""
+            self.llm_model_select.blockSignals(True)
+            self.llm_model_select.clear()
+            self.llm_model_select.addItems(final)
+            self.llm_model_select.blockSignals(False)
+
+            # Restore selection if possible
+            if cur and cur in final:
+                self.llm_model_select.setCurrentText(cur)
             else:
-                if not silent:
-                    QMessageBox.information(self, "LLM Models", "Could not parse model catalog; keeping defaults.")
-                self.status.setText("LLM model list unchanged")
+                self.llm_model_select.setCurrentIndex(0)
+            self.llm_model_name = self.llm_model_select.currentText()
+
+            self.status.setText("LLM model list updated")
+
+        except Exception as e:
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    "LLM Models",
+                    "Could not refresh model list (offline?). Keeping defaults.
+
+Details: " + str(e),
+                )
+            self.status.setText("LLM model list unchanged")
         except Exception as e:
             if not silent:
                 QMessageBox.information(
@@ -3160,6 +3221,8 @@ class App(QWidget):
 
     def _snap_time_to_silence(self, t: float, window_s: float = 1.5) -> float:
         # Snap to nearest detected silence boundary if close enough.
+        # Silence detection is currently disabled for performance.
+        # This remains as a safe no-op when no silence points exist.
         if not self.silence_points or self.duration_s <= 0:
             return t
         silence_s = [max(0.0, min(self.duration_s, float(p) * self.duration_s)) for p in self.silence_points]
