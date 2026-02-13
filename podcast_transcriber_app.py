@@ -229,12 +229,11 @@ def ensure_import(module_name: str, pip_name: Optional[str] = None) -> None:
 
     if IS_RESTRICTED_RUNTIME:
         raise ImportError(
-            f"Missing dependency: {module_name}.
-
-"
+            f"Missing dependency: {module_name}.\n\n"
             "This environment does not support installing packages (subprocess disabled). "
             "Run the app locally (desktop Python) or use a packaged portable release."
         )
+
 
     if not _can_pip_install():
         raise ImportError(f"Missing dependency: {module_name} (pip/ensurepip unavailable)")
@@ -254,13 +253,10 @@ def ensure_import(module_name: str, pip_name: Optional[str] = None) -> None:
             # Trim to keep dialogs readable
             out = (p.stdout or "")[-4000:]
             err = (p.stderr or "")[-4000:]
-            raise RuntimeError(f"pip failed (exit {p.returncode}).
+            raise RuntimeError(
+                f"pip failed (exit {p.returncode}).\n\nstdout:\n{out}\n\nstderr:\n{err}"
+            )
 
-stdout:
-{out}
-
-stderr:
-{err}")
 
     target = _pydeps_active_site_dir()
 
@@ -292,14 +288,13 @@ stderr:
             hint = ""
             if pip_name.lower() == "gpt4all" and sys.version_info >= (3, 12):
                 hint = (
-                    "
-
-Common cause on Windows: gpt4all may not provide a prebuilt wheel for your Python version. "
-                    "If so, pip will fail unless build tools are installed.
-"
+                    "\n\nCommon cause on Windows: gpt4all may not provide a prebuilt wheel for your Python version. "
+                    "If so, pip will fail unless build tools are installed.\n"
                     "Best fix for an indie release: bundle gpt4all inside the packaged app, or run dev with Python 3.11."
                 )
+
             raise ImportError(f"Failed to auto-install dependency {pip_name}: {e}{hint}")
+
 
     # Make sure the newly-installed target is importable
     if target not in sys.path:
@@ -2578,15 +2573,7 @@ class App(QWidget):
 
                 )
             self.status.setText("LLM model list unchanged")
-        except Exception as e:
-            if not silent:
-                QMessageBox.information(
-                    self,
-                    "LLM Models",
-                    "Could not refresh model list (offline?). Keeping defaults.\n\nDetails: " + str(e),
-                )
-
-            self.status.setText("LLM model list unchanged")
+        
     # ------------------------------
     # Dependency Status UX
     # ------------------------------
