@@ -33,6 +33,7 @@ import urllib.request
 import warnings
 import re
 import hashlib
+import threading
 warnings.filterwarnings(
     "ignore",
     category=RuntimeWarning,
@@ -311,7 +312,6 @@ def ensure_import(module_name: str, pip_name: Optional[str] = None) -> None:
 if (not IS_RESTRICTED_RUNTIME) and (not getattr(sys, "frozen", False)):
     for _mod, _pip in [
         ("numpy", "numpy"),
-        ("pydub", "pydub"),
         ("sklearn", "scikit-learn"),
         ("faster_whisper", "faster-whisper"),
     ]:
@@ -702,9 +702,10 @@ def seconds_to_timestamp(sec: float) -> str:
 def detect_silence_boundaries_fraction(audio_path: str) -> List[float]:
     """Return silence start times as fractions [0..1] of duration.
 
-    NOTE: Silence detection is optional and can be expensive on some machines.
-    This helper remains for future use but is not called during audio load.
+    NOTE: Optional feature (currently not used by default).
+    Kept for future snapping, but intentionally not used during audio load.
     """
+    ensure_import("pydub", "pydub")
     from pydub import AudioSegment, silence
 
     audio = AudioSegment.from_file(audio_path)
@@ -716,6 +717,177 @@ def detect_silence_boundaries_fraction(audio_path: str) -> List[float]:
         silence_thresh=audio.dBFS - 16,
     )
     return [max(0.0, min(1.0, (s[0] / 1000.0) / dur_s)) for s in sil]
+
+
+def _ffprobe_duration_seconds(audio_path: str, ffmpeg_path: Optional[str]) -> Optional[float]:
+    """Fast duration lookup using ffprobe (preferred) or ffmpeg fallback."""
+    try:
+        exe = None
+        if ffmpeg_path and os.path.exists(ffmpeg_path):
+            base = os.path.dirname(ffmpeg_path)
+            cand = os.path.join(base, "ffprobe.exe" if platform.system() == "Windows" else "ffprobe")
+            if os.path.exists(cand):
+                exe = cand
+        if exe is None:
+            exe = shutil.which("ffprobe")
+        if not exe:
+            return None
+
+        p = subprocess.run(
+            [exe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if p.returncode != 0:
+            return None
+        val = (p.stdout or "").strip()
+        if not val:
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _waveform_peaks_ffmpeg(
+    audio_path: str,
+    ffmpeg_path: Optional[str],
+    *,
+    target_points: int = 20000,
+    sample_rate: int = 8000,
+) -> Tuple[np.ndarray, float]:
+    """Compute a lightweight waveform using ffmpeg piping.
+
+    This avoids pydub decode overhead and is much faster for large MP3s.
+    Returns (wave_peaks, duration_s).
+    """
+    ff = ffmpeg_path or shutil.which("ffmpeg")
+    if not ff:
+        raise RuntimeError("FFmpeg not found")
+
+    dur = _ffprobe_duration_seconds(audio_path, ffmpeg_path)
+
+    # Decode to raw 16-bit PCM mono at low sample rate
+    cmd = [
+        ff,
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        audio_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]
+
+    # Read PCM stream and aggregate into peaks
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+
+    # If duration unknown, estimate from audio length later.
+    # If duration known, compute block size so we yield ~target_points.
+    if dur and dur > 0:
+        total_samples = int(dur * sample_rate)
+        block = max(1, total_samples // max(1, int(target_points)))
+    else:
+        block = 4096  # adaptive-ish default
+
+    peaks: List[float] = []
+    pending = np.empty(0, dtype=np.int16)
+
+    bytes_per_sample = 2
+    chunk_bytes = 1024 * 64
+
+    read_samples = 0
+    try:
+        while True:
+            chunk = proc.stdout.read(chunk_bytes)
+            if not chunk:
+                break
+            arr = np.frombuffer(chunk, dtype=np.int16)
+            read_samples += int(arr.size)
+
+            if pending.size:
+                arr = np.concatenate([pending, arr])
+                pending = np.empty(0, dtype=np.int16)
+
+            n = arr.size
+            if n < block:
+                pending = arr
+                continue
+
+            usable = (n // block) * block
+            cut = arr[:usable]
+            pending = arr[usable:]
+
+            # reshape and take max abs per block
+            cut = cut.reshape((-1, block))
+            p = np.max(np.abs(cut).astype(np.int32), axis=1).astype(np.float32)
+            peaks.extend(p.tolist())
+
+            # early stop if we already have plenty and duration was unknown
+            if (dur is None) and len(peaks) > target_points * 2:
+                # increase block size on the fly to reduce memory
+                block *= 2
+
+        # flush remainder
+        if pending.size:
+            peaks.append(float(np.max(np.abs(pending).astype(np.int32))))
+
+        rc = proc.wait(timeout=20)
+        if rc != 0:
+            # Consume stderr for debug context
+            err = (proc.stderr.read() if proc.stderr else b"")
+            raise RuntimeError((err or b"ffmpeg failed").decode("utf-8", errors="replace")[-2000:])
+
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            if proc.stderr:
+                proc.stderr.close()
+        except Exception:
+            pass
+
+    wave = np.asarray(peaks, dtype=np.float32)
+    if wave.size == 0:
+        wave = np.zeros(1, dtype=np.float32)
+
+    # Derive duration if unknown
+    if dur is None:
+        dur = read_samples / float(sample_rate)
+
+    return wave, float(dur or 0.0)
+
+
+def load_waveform(audio_path: str, downsample: int = 1000) -> Tuple[np.ndarray, float]:
+    """Legacy helper (not used by the UI). Kept for compatibility."""
+    ensure_import("pydub", "pydub")
+    from pydub import AudioSegment
+
+    audio = AudioSegment.from_file(audio_path)
+    dur_s = len(audio) / 1000.0
+
+    samples = np.array(audio.get_array_of_samples())
+    if audio.channels > 1:
+        samples = samples.reshape((-1, audio.channels)).mean(axis=1)
+
+    if len(samples) == 0:
+        return np.zeros(1, dtype=np.float32), dur_s
+
+    ds = max(1, int(downsample))
+    wave = samples[::ds].astype(np.float32)
+    return wave, dur_s
+
 
 
 def load_waveform(audio_path: str, downsample: int = 1000) -> Tuple[np.ndarray, float]:
@@ -840,6 +1012,10 @@ def _clean_keywords(words: List[str]) -> List[str]:
     return uniq
 
 
+_ST_MODEL = None
+_ST_LOCK = threading.Lock()
+
+
 def _maybe_load_sentence_transformer():
     """Optional enhanced topic model. Lazy-load so it doesn't slow startup.
 
@@ -861,12 +1037,17 @@ def _maybe_load_sentence_transformer():
 
         cache = os.path.join(models_dir(), "sentence_transformers")
         os.makedirs(cache, exist_ok=True)
-        return SentenceTransformer(
+        global _ST_MODEL
+        with _ST_LOCK:
+            if _ST_MODEL is not None:
+                return _ST_MODEL
 
-            "sentence-transformers/all-MiniLM-L6-v2",
-            cache_folder=cache,
-            device="cpu",
-        )
+            _ST_MODEL = SentenceTransformer(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                cache_folder=cache,
+                device="cpu",
+            )
+            return _ST_MODEL
 
     except Exception:
         return None
@@ -1568,13 +1749,12 @@ def parse_transcript_editor(text: str) -> List[dict]:
 class AudioLoadWorker(QThread):
     """Background audio analysis to avoid UI freezes.
 
-    IMPORTANT UX/PERF CHANGE:
-    - Audio *loading* should feel instant.
-    - Waveform generation is done in the background.
+    PERF CHANGE:
+    - Waveform generation uses ffmpeg piping (fast) instead of pydub.
     - Silence detection is DISABLED by default because it can be slow.
 
-    If you want silence snapping later, re-enable it behind a user toggle and
-    compute it on demand (e.g., when user enables snapping).
+    The UI treats a file as "loaded" immediately; this worker only produces
+    the lightweight waveform data for drawing.
     """
 
     progress = Signal(int)
@@ -1589,40 +1769,22 @@ class AudioLoadWorker(QThread):
 
     def run(self) -> None:
         try:
-            from pydub import AudioSegment
-
-            if self.ffmpeg_path:
-                AudioSegment.converter = self.ffmpeg_path
-
-            self.status.emit("Decoding audio...")
+            self.status.emit("Analyzing waveform (ffmpeg)...")
             self.progress.emit(5)
 
-            # Decode once
-            audio = AudioSegment.from_file(self.audio_path)
-            dur_s = max(0.001, len(audio) / 1000.0)
-
-            # Use a lighter representation for analysis to stay fast
-            self.status.emit("Analyzing waveform...")
-            self.progress.emit(20)
-
-            # Convert to mono + lower sample rate for analysis (much faster/less memory)
-            a = audio.set_channels(1).set_frame_rate(8000)
-            samples = np.array(a.get_array_of_samples(), dtype=np.int16)
-
-            if samples.size == 0:
-                wave = np.zeros(1, dtype=np.float32)
-            else:
-                # Downsample to ~20k points max for drawing
-                target_points = 20000
-                step = max(1, int(samples.size / max(1, target_points)))
-                wave = samples[::step].astype(np.float32)
+            wave, dur_s = _waveform_peaks_ffmpeg(
+                self.audio_path,
+                self.ffmpeg_path,
+                target_points=20000,
+                sample_rate=8000,
+            )
 
             self.progress.emit(100)
 
             # Silence detection intentionally disabled (speed / UX).
             silence_points: List[float] = []
 
-            self.finished.emit(wave, dur_s, silence_points)
+            self.finished.emit(wave, float(dur_s), silence_points)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -1748,12 +1910,7 @@ class LLMChapterTitleWorker(QThread):
 
             dev = self._device_string()
             self.status.emit("Loading local LLM (first run may download a model)...")
-            llm = GPT4All(
-                self.model_name,
-                model_path=gpt4all_models_dir(),
-                allow_download=True,
-                device=dev,
-            )
+            llm = _get_gpt4all_instance(self.model_name, dev)
 
             titles: List[str] = []
             for i, ch in enumerate(self.chapters, 1):
@@ -1770,6 +1927,7 @@ class LLMChapterTitleWorker(QThread):
                     f"TRANSCRIPT EXCERPT:\n{excerpt}\n\nTITLE:"
                 )
 
+
                 try:
                     out = llm.generate(prompt, max_tokens=24, temp=0.2, top_p=0.9)
                 except TypeError:
@@ -1782,6 +1940,30 @@ class LLMChapterTitleWorker(QThread):
 
         except Exception as e:
             self.failed.emit(str(e))
+
+
+_GPT4ALL_LOCK = threading.Lock()
+_GPT4ALL_CACHE = {}  # key=(model_name, device_str) -> GPT4All
+
+
+def _get_gpt4all_instance(model_name: str, device: str | None):
+    """Cache GPT4All instances so we don't trigger multiple downloads/loads."""
+    ensure_import("gpt4all", "gpt4all")
+    from gpt4all import GPT4All  # type: ignore
+
+    key = (model_name, device or "auto")
+    with _GPT4ALL_LOCK:
+        inst = _GPT4ALL_CACHE.get(key)
+        if inst is not None:
+            return inst
+        inst = GPT4All(
+            model_name,
+            model_path=gpt4all_models_dir(),
+            allow_download=True,
+            device=device,
+        )
+        _GPT4ALL_CACHE[key] = inst
+        return inst
 
 
 class LLMShowNotesWorker(QThread):
@@ -1844,12 +2026,7 @@ class LLMShowNotesWorker(QThread):
 
             dev = self._device_string()
             self.status.emit("Loading local LLM (first run may download a model)...")
-            llm = GPT4All(
-                self.model_name,
-                model_path=gpt4all_models_dir(),
-                allow_download=True,
-                device=dev,
-            )
+            llm = _get_gpt4all_instance(self.model_name, dev)
 
             ctx = self._build_context()
             self.status.emit("Generating show notes...")
@@ -1901,6 +2078,119 @@ class LLMShowNotesWorker(QThread):
 # ------------------------------
 # Main App
 # ------------------------------
+
+class ChapterGenerationWorker(QThread):
+    """Generate chapters (and optionally LLM titles) off the UI thread.
+
+    This prevents the UI from freezing during:
+    - sentence-transformers model download/load ("Better topic detection")
+    - GPT4All model download/load (LLM titling)
+    """
+
+    status = Signal(str)
+    progress = Signal(int)
+    finished = Signal(list)  # List[Chapter]
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        segments: List[dict],
+        duration_s: float,
+        silence_points: List[float],
+        target_chapters: int,
+        use_embeddings: bool,
+        do_llm_titles: bool,
+        llm_model_name: str,
+        llm_device_mode: str,
+    ):
+        super().__init__()
+        self.segments = segments
+        self.duration_s = duration_s
+        self.silence_points = silence_points
+        self.target_chapters = target_chapters
+        self.use_embeddings = use_embeddings
+        self.do_llm_titles = do_llm_titles
+        self.llm_model_name = llm_model_name
+        self.llm_device_mode = llm_device_mode
+
+    def _device_string(self) -> str | None:
+        m = (self.llm_device_mode or "Auto").strip().lower()
+        if m == "cpu":
+            return "cpu"
+        if m == "gpu":
+            return _llm_pick_device(prefer_gpu=True) or "cpu"
+        return None
+
+    def _chapter_text(self, ch: Chapter, max_chars: int = 1800) -> str:
+        parts: List[str] = []
+        for s in self.segments:
+            st = float(s.get("start", 0.0))
+            if st < float(ch.start) - 1e-6:
+                continue
+            if st >= float(ch.end) - 1e-6:
+                break
+            tx = (s.get("text") or "").strip()
+            if tx:
+                parts.append(tx)
+            if sum(len(p) for p in parts) >= max_chars:
+                break
+        return " ".join(parts).strip()[:max_chars]
+
+    def run(self) -> None:
+        try:
+            self.status.emit("Analyzing transcript for chapter boundaries...")
+            self.progress.emit(5)
+
+            # Heavy work: topic clustering (may download embeddings model)
+            try:
+                chs = topic_cluster_chapters(
+                    self.segments,
+                    duration_s=self.duration_s,
+                    silence_points=self.silence_points,
+                    target_chapters=int(self.target_chapters),
+                    use_embeddings=bool(self.use_embeddings),
+                )
+            except Exception:
+                self.status.emit("Better topic detection failed; using fast fallback...")
+                chs = topic_cluster_chapters(
+                    self.segments,
+                    duration_s=self.duration_s,
+                    silence_points=self.silence_points,
+                    target_chapters=int(self.target_chapters),
+                    use_embeddings=False,
+                )
+
+            self.progress.emit(60)
+
+            # Optional: local LLM titles (may download model)
+            if self.do_llm_titles and chs:
+                self.status.emit("Generating titles with local LLM (first run may download)...")
+                dev = self._device_string()
+                llm = _get_gpt4all_instance(self.llm_model_name, dev)
+
+                for i, ch in enumerate(chs, 1):
+                    excerpt = self._chapter_text(ch)
+                    if excerpt:
+                        prompt = (
+                    "You are generating a podcast chapter title. "
+                    "Return ONLY one short title (2-6 words), no quotes, no trailing punctuation. "
+                    "Avoid filler words like 'know', 'just', 'like'. Use natural phrasing.\n\n"
+                    f"TRANSCRIPT EXCERPT:\n{excerpt}\n\nTITLE:"
+                )
+                        try:
+                            out = llm.generate(prompt, max_tokens=24, temp=0.2, top_p=0.9)
+                        except TypeError:
+                            out = llm.generate(prompt)
+                        ch.title = _sanitize_llm_title(str(out).splitlines()[0] if out else ch.title)
+
+                    # Progress from 60..95
+                    self.progress.emit(60 + int((i / max(1, len(chs))) * 35))
+
+            self.progress.emit(100)
+            self.finished.emit(chs)
+        except Exception as e:
+            self.failed.emit(str(e))
+
 
 class App(QWidget):
     def __init__(self):
@@ -2212,6 +2502,16 @@ class App(QWidget):
         chap_row.addWidget(self.btn_export)
 
         t3.addLayout(chap_row)
+
+        # Chapter generation progress (prevents "Not Responding" UX)
+        self.chap_progress = QProgressBar()
+        self.chap_progress.setRange(0, 100)
+        self.chap_progress.setValue(0)
+        self.chap_progress.setVisible(False)
+        t3.addWidget(self.chap_progress)
+
+        self.lbl_ch_status = QLabel("")
+        t3.addWidget(self.lbl_ch_status)
 
         self.list_chapters = QListWidget()
         self.list_chapters.currentRowChanged.connect(self.on_chapter_selected)
@@ -3103,67 +3403,56 @@ class App(QWidget):
             QMessageBox.information(self, "Chapters", "Transcribe first.")
             return
 
-        try:
-            use_emb = self.chk_topic_embeddings.isChecked()
-            self.chapters = topic_cluster_chapters(
-                self.segments,
-                duration_s=self.duration_s,
-                silence_points=self.silence_points,
-                target_chapters=int(self.spn_target_chapters.value()) if hasattr(self, "spn_target_chapters") else 10,
-                use_embeddings=use_emb,
-            )
-        except Exception as e:
-            # Hard fallback: embeddings can fail due to torch/device/download issues.
+        # Prevent re-entry / repeated downloads
+        if hasattr(self, "chap_worker") and getattr(self, "chap_worker", None) is not None:
             try:
-                self.chapters = topic_cluster_chapters(
-                    self.segments,
-                    duration_s=self.duration_s,
-                    silence_points=self.silence_points,
-                    target_chapters=10,
-                    use_embeddings=False,
-                )
-                QMessageBox.warning(
-                    self,
-                    "Chapters",
-                    "Better topic detection failed, so the app used the fast TF-IDF fallback.\n\n"
-                    f"Details: {e}",
-                )
+                if self.chap_worker.isRunning():
+                    QMessageBox.information(self, "Chapters", "Chapter generation is already running.")
+                    return
+            except Exception:
+                pass
 
-            except Exception as e2:
-                QMessageBox.critical(self, "Chapters", f"Chapter generation failed: {e2}")
-                return
-        self._refresh_chapter_view()
-        self.status.setText("Chapters generated")
+        use_emb = self.chk_topic_embeddings.isChecked()
+        target = int(self.spn_target_chapters.value()) if hasattr(self, "spn_target_chapters") else 10
+        do_llm = bool(getattr(self, "chk_llm_titles", None) and self.chk_llm_titles.isChecked())
 
-        # Optional: improve titles using local LLM
-        if hasattr(self, "chk_llm_titles") and self.chk_llm_titles.isChecked():
-            try:
-                self.llm_title_worker = LLMChapterTitleWorker(
-                    model_name=self.llm_model_name,
-                    device_mode=self.llm_device_mode,
-                    chapters=self.chapters,
-                    segments=self.segments,
-                )
-                self.llm_title_worker.status.connect(self.status.setText)
-                self.llm_title_worker.failed.connect(
-                    lambda e: QMessageBox.warning(
-                        self,
-                        "LLM Titles",
-                        "Local LLM titling failed; keeping heuristic titles.\n\nDetails: " + str(e),
-                    )
-                )
+        self.btn_chapters.setEnabled(False)
+        self.chap_progress.setVisible(True)
+        self.chap_progress.setValue(0)
+        self.lbl_ch_status.setText("Starting...")
+        self.status.setText("Generating chapters...")
 
-                def _apply_titles(titles: List[str]):
-                    for i, t in enumerate(titles):
-                        if i < len(self.chapters):
-                            self.chapters[i].title = t
-                    self._refresh_chapter_view()
-                    self.status.setText("Chapters generated (LLM titles)")
+        self.chap_worker = ChapterGenerationWorker(
+            segments=list(self.segments),
+            duration_s=float(self.duration_s),
+            silence_points=list(self.silence_points),
+            target_chapters=target,
+            use_embeddings=use_emb,
+            do_llm_titles=do_llm,
+            llm_model_name=str(self.llm_model_name),
+            llm_device_mode=str(self.llm_device_mode),
+        )
 
-                self.llm_title_worker.finished.connect(_apply_titles)
-                self.llm_title_worker.start()
-            except Exception as e:
-                QMessageBox.warning(self, "LLM Titles", f"Could not start LLM titling: {e}")
+        self.chap_worker.status.connect(self.lbl_ch_status.setText)
+        self.chap_worker.progress.connect(self.chap_progress.setValue)
+
+        def _done(chs: list):
+            self.chapters = chs
+            self._refresh_chapter_view()
+            self.status.setText("Chapters generated")
+            self.lbl_ch_status.setText("Done")
+            self.chap_progress.setVisible(False)
+            self.btn_chapters.setEnabled(True)
+
+        def _fail(err: str):
+            self.chap_progress.setVisible(False)
+            self.btn_chapters.setEnabled(True)
+            self.status.setText("Chapter generation failed")
+            QMessageBox.critical(self, "Chapters", "Chapter generation failed:\n\n" + str(err))
+
+        self.chap_worker.finished.connect(_done)
+        self.chap_worker.failed.connect(_fail)
+        self.chap_worker.start()
 
     def on_marker_changed(self, idx: int, frac: float) -> None:
         # Update chapter start times based on marker dragging
