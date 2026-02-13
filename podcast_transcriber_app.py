@@ -34,6 +34,8 @@ import warnings
 import re
 import hashlib
 import threading
+import contextlib
+import io
 warnings.filterwarnings(
     "ignore",
     category=RuntimeWarning,
@@ -1947,15 +1949,51 @@ _GPT4ALL_CACHE = {}  # key=(model_name, device_str) -> GPT4All
 
 
 def _get_gpt4all_instance(model_name: str, device: str | None):
-    """Cache GPT4All instances so we don't trigger multiple downloads/loads."""
+    """Cache GPT4All instances so we don't trigger multiple downloads/loads.
+
+    NOTE (Windows): GPT4All may print benign warnings like:
+      "Failed to load llamamodel-mainline-cuda.dll: LoadLibraryExW failed with error 0x7e"
+    when CUDA runtime DLLs are not present. This can happen even if CPU inference is used.
+
+    To keep the end-user experience clean, we suppress those constructor-time warnings.
+    We also harden device selection by falling back to CPU when GPU backends are unavailable.
+    """
     ensure_import("gpt4all", "gpt4all")
     from gpt4all import GPT4All  # type: ignore
 
-    key = (model_name, device or "auto")
+    # Harden device selection
+    dev = device
+    try:
+        if dev == "cuda":
+            import torch  # type: ignore
+            if not torch.cuda.is_available():
+                dev = "cpu"
+        if dev == "gpu":
+            # "gpu" is intended for Apple/Metal; if not mac arm64, fall back.
+            if not (sys.platform == "darwin" and platform.machine() == "arm64"):
+                dev = None
+    except Exception:
+        # If torch isn't available or any check fails, default to CPU for explicit CUDA.
+        if dev == "cuda":
+            dev = "cpu"
+
+    key = (model_name, dev or "auto")
     with _GPT4ALL_LOCK:
         inst = _GPT4ALL_CACHE.get(key)
         if inst is not None:
             return inst
+
+        # Suppress noisy constructor warnings (esp. missing CUDA runtime on Windows)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            inst = GPT4All(
+                model_name,
+                model_path=gpt4all_models_dir(),
+                allow_download=True,
+                device=dev,
+            )
+        _GPT4ALL_CACHE[key] = inst
+        return inst
         inst = GPT4All(
             model_name,
             model_path=gpt4all_models_dir(),
