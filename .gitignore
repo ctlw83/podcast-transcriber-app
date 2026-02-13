@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# App data / portable data
+data/
+*.log
+
+# Large model caches (HF / GPT4All / Whisper)
+models/
+catalog_cache/
+pydeps/
+covers/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Build outputs
+dist/
+build/
+*.spec
