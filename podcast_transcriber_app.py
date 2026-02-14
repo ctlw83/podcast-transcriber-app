@@ -1979,7 +1979,9 @@ def _get_gpt4all_instance(model_name: str, device: str | None):
 
 class LLMShowNotesWorker(QThread):
     """Generate show title + summary + bullets with a local LLM (GPT4All)."""
+
     status = Signal(str)
+    progress = Signal(int)
     finished = Signal(str, str, str)  # title, summary, bullets(markdown)
     failed = Signal(str)
 
@@ -1998,65 +2000,101 @@ class LLMShowNotesWorker(QThread):
             return _llm_pick_device(prefer_gpu=True) or "cpu"
         return None
 
+    def _fallback_title(self) -> str:
+        head = " ".join(
+            [(s.get("text") or "").strip() for s in self.segments if float(s.get("start", 0.0)) <= 180.0]
+        ).strip()
+        if not head:
+            head = " ".join([(s.get("text") or "").strip() for s in self.segments[:40]]).strip()
+        return _make_title_from_text(head, max_terms=3)
+
     def _build_context(self, max_chars: int = 9000) -> str:
+        """Build an LLM context that encourages topical notes.
+
+        UX: prefer transcript coverage over chapter snippets.
+        """
         chunks: List[str] = []
+
+        # Optional outline: titles only (no excerpts)
         if self.chapters:
-            for ch in self.chapters[:12]:
-                chunks.append(f"[{seconds_to_timestamp(ch.start)} - {seconds_to_timestamp(ch.end)}] {ch.title}")
-                excerpt_parts: List[str] = []
-                for s in self.segments:
-                    st = float(s.get("start", 0.0))
-                    if st < float(ch.start) - 1e-6:
-                        continue
-                    if st >= float(ch.end) - 1e-6:
-                        break
-                    tx = (s.get("text") or "").strip()
-                    if tx:
-                        excerpt_parts.append(tx)
-                    if sum(len(p) for p in excerpt_parts) >= 500:
-                        break
-                if excerpt_parts:
-                    chunks.append("Excerpt: " + " ".join(excerpt_parts)[:520])
-                if sum(len(x) for x in chunks) >= max_chars:
-                    break
+            chunks.append("CHAPTER OUTLINE (titles only):")
+            for ch in self.chapters[:16]:
+                t = (ch.title or "").strip() or "Chapter"
+                chunks.append(f"- {seconds_to_timestamp(ch.start)} {t}")
+            chunks.append("")
+
+        if not self.segments:
+            return "\n".join(chunks)[:max_chars]
+
+        # Sample transcript across the whole episode
+        target_samples = 60
+        segs = self.segments
+        n = len(segs)
+
+        if n <= target_samples:
+            picked = list(range(n))
         else:
-            for s in self.segments:
-                if float(s.get("start", 0.0)) > 240.0:
-                    break
-                tx = (s.get("text") or "").strip()
-                if tx:
-                    chunks.append(tx)
-                if sum(len(x) for x in chunks) >= max_chars:
-                    break
+            step = max(1, n // target_samples)
+            picked = list(range(0, n, step))
+
+        # Ensure we include early context (intros often contain topic framing)
+        early = [i for i, s in enumerate(segs) if float(s.get("start", 0.0)) <= 240.0]
+        picked = sorted(set(early + picked))
+
+        chunks.append("TRANSCRIPT (samples):")
+        for i in picked:
+            s = segs[i]
+            tx = (s.get("text") or "").strip()
+            if not tx:
+                continue
+            ts = seconds_to_timestamp(float(s.get("start", 0.0)))
+            chunks.append(f"[{ts}] {tx}")
+            if sum(len(x) for x in chunks) >= max_chars:
+                break
+
         return "\n".join(chunks)[:max_chars]
 
     def run(self) -> None:
         try:
             ensure_import("gpt4all", "gpt4all")
-            from gpt4all import GPT4All  # type: ignore
 
             dev = self._device_string()
             self.status.emit("Loading local LLM (first run may download a model)...")
+            self.progress.emit(5)
             llm = _get_gpt4all_instance(self.model_name, dev)
+            self.progress.emit(20)
 
             ctx = self._build_context()
+            self.progress.emit(30)
             self.status.emit("Generating show notes...")
 
-            prompt = (
-                "You help podcasters write episode metadata. "
-                "Write in a friendly, fun tone, but keep it accurate. "
-                "Return EXACTLY in this format (no extra text):\n"
-                "TITLE: <one catchy title>\n"
-                "SUMMARY: <2-4 sentences>\n"
-                "BULLETS:\n- <bullet 1>\n- <bullet 2>\n- <bullet 3>\n"
-                "(5-10 bullets total, Markdown)\n\n"
-                f"CONTEXT:\n{ctx}\n"
-            )
+            prompt = f"""You help podcasters write episode metadata.
+Write in a friendly, fun tone, but keep it accurate.
 
+IMPORTANT:
+- Write TOPICAL notes based on the transcript.
+- Do NOT paste transcript snippets.
+- Do NOT title the episode 'Chapter' or 'Episode'. Avoid generic titles.
+
+Return EXACTLY in this format (no extra text):
+TITLE: <one catchy title>
+SUMMARY: <2-4 sentences>
+BULLETS:
+- <bullet 1>
+- <bullet 2>
+- <bullet 3>
+(5-10 bullets total, Markdown)
+
+CONTEXT:
+{ctx}
+"""
+
+            self.progress.emit(45)
             try:
                 out = llm.generate(prompt, max_tokens=450, temp=0.3, top_p=0.9)
             except TypeError:
                 out = llm.generate(prompt)
+            self.progress.emit(90)
 
             text = str(out or "").strip()
 
@@ -2067,7 +2105,7 @@ class LLMShowNotesWorker(QThread):
             m_title = re.search(r"(?im)^TITLE:\s*(.+)$", text)
             if m_title:
                 title = m_title.group(1).strip()
-            m_sum = re.search(r"(?is)SUMMARY:\s*(.+?)(?:\n\s*BULLETS:|\Z)", text)
+            m_sum = re.search(r"(?is)SUMMARY:\s*(.+?)(?:\n\s*BULLETS:|$)", text)
             if m_sum:
                 summary = m_sum.group(1).strip()
             m_bul = re.search(r"(?is)BULLETS:\s*(.+)$", text)
@@ -2075,11 +2113,16 @@ class LLMShowNotesWorker(QThread):
                 bullets = m_bul.group(1).strip()
 
             title = _sanitize_llm_title(title)
+            if title.lower() in ("chapter", "episode") or title.lower().startswith("chapter "):
+                title = _sanitize_llm_title(self._fallback_title())
+
             if not summary:
                 summary = text[:800].strip()
             if not bullets:
                 bullets = "- " + "\n- ".join([x.strip() for x in text.splitlines() if x.strip()][:8])
 
+
+            self.progress.emit(100)
             self.finished.emit(title, summary, bullets)
 
         except Exception as e:
@@ -2656,6 +2699,13 @@ class App(QWidget):
         self.btn_export_notes.clicked.connect(self.export_show_notes)
         notes_row.addWidget(self.btn_export_notes)
         t5.addLayout(notes_row)
+
+        # LLM progress (matches the Transcript tab UX)
+        self.notes_progress = QProgressBar()
+        self.notes_progress.setRange(0, 100)
+        self.notes_progress.setValue(0)
+        self.notes_progress.setVisible(False)
+        t5.addWidget(self.notes_progress)
 
         # Markdown helper toolbar (applies to whichever notes editor is focused)
         md_row = QHBoxLayout()
@@ -3997,7 +4047,90 @@ class App(QWidget):
         if not full:
             QMessageBox.information(self, "Show Notes", "Transcript is empty.")
             return
+
+        # Local fallback (fast, no LLM) — used when LLM is disabled or fails.
+        def _fallback_local() -> None:
+            # Sentence split
+            sents = [x.strip() for x in re.split(r"(?<=[.!?]) +", full) if x.strip()]
+            if len(sents) < 6:
+                sents = [full]
+
+            st_model = _maybe_load_sentence_transformer()
+
+            def _tfidf_pick(sentences: List[str], k: int) -> List[str]:
+                vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=20000)
+                X = vec.fit_transform([_normalize_text_for_topics(s) for s in sentences])
+                centroid = np.asarray(X.mean(axis=0)).ravel()
+                scores = np.asarray(X.dot(centroid)).ravel()
+                idx = np.argsort(scores)[::-1][:k]
+                return [sentences[i] for i in sorted(idx)]
+
+            head = " ".join(
+                [(s.get("text") or "").strip() for s in self.segments if float(s.get("start", 0.0)) <= 180.0]
+            ).strip() or full
+
+            suggested_title = _make_title_from_text(head, max_terms=3)
+            self.notes_title.setText(suggested_title)
+
+            k_summary = 4
+            k_bullets = 8
+
+            summary = "\n\n".join(_tfidf_pick(sents, k_summary))
+            bullets = "\n".join([f"- {s}" for s in _tfidf_pick(sents, k_bullets)])
+
+            # Optional embeddings refinement
+            if st_model is not None and len(sents) > 1:
+                try:
+                    emb = st_model.encode(
+                        [_normalize_text_for_topics(s) for s in sents],
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
+                    emb = np.asarray(emb, dtype=np.float32)
+                    centroid = emb.mean(axis=0)
+                    centroid = centroid / max(1e-9, np.linalg.norm(centroid))
+                    sim_to_cent = emb @ centroid
+
+                    def pick(k: int) -> List[int]:
+                        picked: List[int] = []
+                        cand = list(range(len(sents)))
+                        for _ in range(min(k, len(cand))):
+                            best_i = None
+                            best_score = -1e9
+                            for i in cand:
+                                red = 0.0
+                                if picked:
+                                    red = float(max(emb[i] @ emb[j] for j in picked))
+                                score = float(sim_to_cent[i]) - 0.4 * red
+                                if score > best_score:
+                                    best_score = score
+                                    best_i = i
+                            if best_i is None:
+                                break
+                            picked.append(best_i)
+                            cand.remove(best_i)
+                        return sorted(picked)
+
+                    sum_idx = pick(k_summary)
+                    bul_idx = pick(k_bullets)
+                    summary = "\n\n".join([sents[i] for i in sum_idx])
+                    bullets = "\n".join([f"- {sents[i]}" for i in bul_idx])
+                except Exception:
+                    pass
+
+            fun = f"In this episode: {suggested_title}.\n\n{summary}"
+
+            self.notes_summary.setPlainText(fun)
+            self.notes_bullets.setPlainText(bullets)
+            self.status.setText("Show notes generated")
+
+        # LLM path
         if hasattr(self, "chk_llm_notes") and self.chk_llm_notes.isChecked():
+            self.btn_gen_notes.setEnabled(False)
+            if hasattr(self, "notes_progress"):
+                self.notes_progress.setVisible(True)
+                self.notes_progress.setValue(0)
+
             self.llm_notes_worker = LLMShowNotesWorker(
                 model_name=self.llm_model_name,
                 device_mode=self.llm_device_mode,
@@ -4005,99 +4138,38 @@ class App(QWidget):
                 chapters=self.chapters,
             )
             self.llm_notes_worker.status.connect(self.status.setText)
-            self.llm_notes_worker.failed.connect(
-                lambda e: QMessageBox.warning(
+            if hasattr(self, "notes_progress"):
+                self.llm_notes_worker.progress.connect(self.notes_progress.setValue)
+
+            def _on_fail(e: str):
+                if hasattr(self, "notes_progress"):
+                    self.notes_progress.setVisible(False)
+                self.btn_gen_notes.setEnabled(True)
+                QMessageBox.warning(
                     self,
                     "LLM Notes",
                     "Local LLM show-notes failed; using fast local fallback.\n\nDetails: " + str(e),
+
                 )
-            )
+                _fallback_local()
+
+            self.llm_notes_worker.failed.connect(_on_fail)
 
             def _apply_notes(title: str, summary: str, bullets: str):
                 self.notes_title.setText(title)
                 self.notes_summary.setPlainText(summary)
                 self.notes_bullets.setPlainText(bullets)
+                if hasattr(self, "notes_progress"):
+                    self.notes_progress.setVisible(False)
+                self.btn_gen_notes.setEnabled(True)
                 self.status.setText("Show notes generated (LLM)")
 
             self.llm_notes_worker.finished.connect(_apply_notes)
             self.llm_notes_worker.start()
             return
 
-        # Sentence split
-        sents = [x.strip() for x in re.split(r"(?<=[.!?]) +", full) if x.strip()]
-        if len(sents) < 6:
-            sents = [full]
-
-        st_model = _maybe_load_sentence_transformer()
-
-        def _tfidf_pick(sentences: List[str], k: int) -> List[str]:
-            vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=20000)
-            X = vec.fit_transform([_normalize_text_for_topics(s) for s in sentences])
-            centroid = np.asarray(X.mean(axis=0)).ravel()
-            # X is sparse; X @ centroid returns a dense ndarray. Use np.asarray for safety.
-            scores = np.asarray(X.dot(centroid)).ravel()
-            idx = np.argsort(scores)[::-1][:k]
-            return [sentences[i] for i in sorted(idx)]
-
-        head = " ".join(
-            [(s.get("text") or "").strip() for s in self.segments if float(s.get("start", 0.0)) <= 180.0]
-        ).strip() or full
-
-        suggested_title = _make_title_from_text(head, max_terms=3)
-        self.notes_title.setText(suggested_title)
-
-        k_summary = 4
-        k_bullets = 8
-
-        # TF-IDF fallback (fast, local)
-        summary = "\n\n".join(_tfidf_pick(sents, k_summary))
-        bullets = "\n".join([f"- {s}" for s in _tfidf_pick(sents, k_bullets)])
-
-        # Optional embeddings refinement
-        if st_model is not None and len(sents) > 1:
-            try:
-                emb = st_model.encode(
-                    [_normalize_text_for_topics(s) for s in sents],
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
-                emb = np.asarray(emb, dtype=np.float32)
-                centroid = emb.mean(axis=0)
-                centroid = centroid / max(1e-9, np.linalg.norm(centroid))
-                sim_to_cent = emb @ centroid
-
-                def pick(k: int) -> List[int]:
-                    picked: List[int] = []
-                    cand = list(range(len(sents)))
-                    for _ in range(min(k, len(cand))):
-                        best_i = None
-                        best_score = -1e9
-                        for i in cand:
-                            red = 0.0
-                            if picked:
-                                red = float(max(emb[i] @ emb[j] for j in picked))
-                            score = float(sim_to_cent[i]) - 0.4 * red
-                            if score > best_score:
-                                best_score = score
-                                best_i = i
-                        if best_i is None:
-                            break
-                        picked.append(best_i)
-                        cand.remove(best_i)
-                    return sorted(picked)
-
-                sum_idx = pick(k_summary)
-                bul_idx = pick(k_bullets)
-                summary = "\n\n".join([sents[i] for i in sum_idx])
-                bullets = "\n".join([f"- {sents[i]}" for i in bul_idx])
-            except Exception:
-                pass
-
-        fun = f"In this episode: {suggested_title}.\n\n{summary}"
-
-        self.notes_summary.setPlainText(fun)
-        self.notes_bullets.setPlainText(bullets)
-        self.status.setText("Show notes generated")
+        # If LLM disabled, use fallback
+        _fallback_local()
 
     def export_show_notes(self) -> None:
         title = (self.notes_title.text() or "").strip()
