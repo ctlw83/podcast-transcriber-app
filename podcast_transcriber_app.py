@@ -891,25 +891,6 @@ def load_waveform(audio_path: str, downsample: int = 1000) -> Tuple[np.ndarray, 
     return wave, dur_s
 
 
-
-def load_waveform(audio_path: str, downsample: int = 1000) -> Tuple[np.ndarray, float]:
-    from pydub import AudioSegment
-
-    audio = AudioSegment.from_file(audio_path)
-    dur_s = len(audio) / 1000.0
-
-    samples = np.array(audio.get_array_of_samples())
-    if audio.channels > 1:
-        samples = samples.reshape((-1, audio.channels)).mean(axis=1)
-
-    if len(samples) == 0:
-        return np.zeros(1, dtype=np.float32), dur_s
-
-    ds = max(1, int(downsample))
-    wave = samples[::ds].astype(np.float32)
-    return wave, dur_s
-
-
 # ------------------------------
 # Chapters
 # ------------------------------
@@ -1994,14 +1975,6 @@ def _get_gpt4all_instance(model_name: str, device: str | None):
             )
         _GPT4ALL_CACHE[key] = inst
         return inst
-        inst = GPT4All(
-            model_name,
-            model_path=gpt4all_models_dir(),
-            allow_download=True,
-            device=device,
-        )
-        _GPT4ALL_CACHE[key] = inst
-        return inst
 
 
 class LLMShowNotesWorker(QThread):
@@ -2449,9 +2422,14 @@ class App(QWidget):
         # Transcript editor
         editor_row = QHBoxLayout()
 
+        self.btn_import_tx = QPushButton("Import SRT/VTT")
+        self.btn_import_tx.clicked.connect(self.import_transcript_clicked)
+        editor_row.addWidget(self.btn_import_tx)
+
         self.btn_apply_edits = QPushButton("Apply Transcript Edits")
         self.btn_apply_edits.clicked.connect(self.apply_transcript_edits)
         editor_row.addWidget(self.btn_apply_edits)
+
 
         self.btn_seek_cursor = QPushButton("Seek to Cursor")
         self.btn_seek_cursor.clicked.connect(self.seek_to_cursor_cue)
@@ -2553,6 +2531,7 @@ class App(QWidget):
 
         self.list_chapters = QListWidget()
         self.list_chapters.currentRowChanged.connect(self.on_chapter_selected)
+        self.list_chapters.itemDoubleClicked.connect(self.on_chapter_double_clicked)
 
         editor = QGroupBox("Chapter Editor")
         fl = QFormLayout()
@@ -3262,6 +3241,59 @@ class App(QWidget):
     # Transcript editing + export
     # ------------------------------
 
+    def import_transcript_clicked(self) -> None:
+        """Import an existing transcript (SRT/VTT) for editing and downstream features."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Transcript",
+            "",
+            "Transcripts (*.vtt *.srt *.txt);;WebVTT (*.vtt);;SubRip (*.srt);;All Files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+            self.txt_transcript.setPlainText(raw)
+
+            parsed = parse_transcript_editor(raw)
+            if not parsed:
+                QMessageBox.information(
+                    self,
+                    "Import Transcript",
+                    "Imported file loaded into the editor, but no cues were detected.\n\n"
+                    "Make sure it's valid SRT or WEBVTT.",
+                )
+
+                return
+
+            parsed.sort(key=lambda s: s["start"])
+            for i in range(len(parsed) - 1):
+                parsed[i]["end"] = max(float(parsed[i]["end"]), float(parsed[i + 1]["start"]))
+
+            self.segments = parsed
+
+            # Enable downstream actions
+            self.btn_export_srt.setEnabled(True)
+            self.btn_export_vtt.setEnabled(True)
+            self.btn_seek_cursor.setEnabled(True)
+            self.btn_chapters.setEnabled(True)
+
+            # Build cue offsets for playback-follow (best effort)
+            self._cue_starts = []
+            self._cue_offsets = []
+            text_now = self.txt_transcript.toPlainText()
+            for m in re.finditer(r"^\s*([0-9:\.,]+)\s*-->\s*([0-9:\.,]+)", text_now, flags=re.M):
+                try:
+                    self._cue_starts.append(_parse_timecode(m.group(1)))
+                    self._cue_offsets.append(int(m.start()))
+                except Exception:
+                    continue
+
+            self.status.setText(f"Imported transcript ({len(self.segments)} cues)")
+        except Exception as e:
+            QMessageBox.critical(self, "Import Transcript", f"Import failed: {e}")
+
     def apply_transcript_edits(self) -> None:
         """Update internal segments from editor contents (best-effort)."""
         raw = self.txt_transcript.toPlainText()
@@ -3560,6 +3592,37 @@ class App(QWidget):
         self.ed_ch_end.setText(seconds_to_timestamp(ch.end))
         self.ed_ch_url.setText(ch.url or "")
         self.ed_ch_img.setText(ch.img or "")
+
+    def on_chapter_double_clicked(self, item: QListWidgetItem) -> None:
+        """Double-click a chapter to seek playback to its start time."""
+        try:
+            row = self.list_chapters.row(item)
+        except Exception:
+            row = self.list_chapters.currentRow()
+
+        if row < 0 or row >= len(self.chapters):
+            return
+
+        ch = self.chapters[row]
+        if self.player is None:
+            QMessageBox.information(
+                self,
+                "Seek",
+                "Seeking is unavailable in external preview mode.\n\n"
+                "Disable 'Use external preview (ffplay)' to enable scrubbing and seeking.",
+            )
+
+            return
+
+        try:
+            self.player.setPosition(int(max(0.0, float(ch.start)) * 1000))
+            # Optional: jump user focus to chapters tab when they interact there
+            try:
+                self.tabs.setCurrentIndex(2)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def add_chapter(self) -> None:
         if self.duration_s <= 0:
