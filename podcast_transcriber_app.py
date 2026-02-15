@@ -2008,14 +2008,22 @@ class LLMShowNotesWorker(QThread):
             head = " ".join([(s.get("text") or "").strip() for s in self.segments[:40]]).strip()
         return _make_title_from_text(head, max_terms=3)
 
-    def _build_context(self, max_chars: int = 9000) -> str:
+    def _build_context(self, *, token_budget: int = 1150) -> str:
         """Build an LLM context that encourages topical notes.
 
-        UX: prefer transcript coverage over chapter snippets.
+        Local GPT4All models often have small context windows (e.g., 2048 tokens).
+        Strategy:
+        - Prefer coverage (samples) over long excerpts
+        - Stay under a conservative token budget
+        - Use a rough chars->tokens heuristic (~4 chars/token)
         """
+
+        def _approx_tokens(s: str) -> int:
+            return max(1, int(len(s) / 4))
+
         chunks: List[str] = []
 
-        # Optional outline: titles only (no excerpts)
+        # Outline: titles only (no excerpts)
         if self.chapters:
             chunks.append("CHAPTER OUTLINE (titles only):")
             for ch in self.chapters[:16]:
@@ -2024,10 +2032,10 @@ class LLMShowNotesWorker(QThread):
             chunks.append("")
 
         if not self.segments:
-            return "\n".join(chunks)[:max_chars]
+            return "\n".join(chunks)
 
-        # Sample transcript across the whole episode
-        target_samples = 60
+        # Transcript sampling across episode
+        target_samples = 45
         segs = self.segments
         n = len(segs)
 
@@ -2037,22 +2045,27 @@ class LLMShowNotesWorker(QThread):
             step = max(1, n // target_samples)
             picked = list(range(0, n, step))
 
-        # Ensure we include early context (intros often contain topic framing)
+        # Ensure early context (intro framing)
         early = [i for i, s in enumerate(segs) if float(s.get("start", 0.0)) <= 240.0]
         picked = sorted(set(early + picked))
 
         chunks.append("TRANSCRIPT (samples):")
+
         for i in picked:
             s = segs[i]
             tx = (s.get("text") or "").strip()
             if not tx:
                 continue
             ts = seconds_to_timestamp(float(s.get("start", 0.0)))
-            chunks.append(f"[{ts}] {tx}")
-            if sum(len(x) for x in chunks) >= max_chars:
+            line = f"[{ts}] {tx}"
+
+            candidate = "\n".join(chunks + [line])
+            if _approx_tokens(candidate) > token_budget:
                 break
 
-        return "\n".join(chunks)[:max_chars]
+            chunks.append(line)
+
+        return "\n".join(chunks)
 
     def run(self) -> None:
         try:
@@ -2064,7 +2077,9 @@ class LLMShowNotesWorker(QThread):
             llm = _get_gpt4all_instance(self.model_name, dev)
             self.progress.emit(20)
 
-            ctx = self._build_context()
+            # Build a context that fits smaller local model context windows.
+            # Keep a conservative budget so the prompt + generation stays under the limit.
+            ctx = self._build_context(token_budget=1150)
             self.progress.emit(30)
             self.status.emit("Generating show notes...")
 
@@ -2090,37 +2105,71 @@ CONTEXT:
 """
 
             self.progress.emit(45)
+
+            # Some local models have very small context windows (often 2048).
+            # If we hit a context error, retry once with a smaller context budget.
             try:
-                out = llm.generate(prompt, max_tokens=450, temp=0.3, top_p=0.9)
-            except TypeError:
-                out = llm.generate(prompt)
+                try:
+                    out = llm.generate(prompt, max_tokens=450, temp=0.3, top_p=0.9)
+                except TypeError:
+                    out = llm.generate(prompt)
+            except Exception as gen_err:
+                msg = str(gen_err)
+                low = msg.lower()
+
+                if ("context window" in low) or ("prompt" in low and "token" in low):
+                    self.status.emit("Prompt too large for this model; retrying with smaller context...")
+                    self.progress.emit(40)
+
+                    ctx2 = self._build_context(token_budget=800)
+                    prompt2 = prompt.split("CONTEXT:\n", 1)[0] + "CONTEXT:\n" + ctx2 + "\n"
+
+                    try:
+                        out = llm.generate(prompt2, max_tokens=420, temp=0.3, top_p=0.9)
+                    except TypeError:
+                        out = llm.generate(prompt2)
+                else:
+                    raise
+
             self.progress.emit(90)
 
             text = str(out or "").strip()
 
-            title = ""
-            summary = ""
-            bullets = ""
-
             m_title = re.search(r"(?im)^TITLE:\s*(.+)$", text)
-            if m_title:
-                title = m_title.group(1).strip()
             m_sum = re.search(r"(?is)SUMMARY:\s*(.+?)(?:\n\s*BULLETS:|$)", text)
-            if m_sum:
-                summary = m_sum.group(1).strip()
             m_bul = re.search(r"(?is)BULLETS:\s*(.+)$", text)
-            if m_bul:
-                bullets = m_bul.group(1).strip()
 
-            title = _sanitize_llm_title(title)
+            # If the model didn't follow the requested format, treat this as a failure so the UI
+            # falls back to the fast local summarizer instead of dumping an error/garbage into editors.
+            if not (m_title and m_sum and m_bul):
+                preview = (
+                    (text or "")[:600]
+                    .strip()
+                    .replace("\r", "")
+                    .replace("\n", " ")
+                )
+                msg = (
+                    "LLM response did not match expected TITLE/SUMMARY/BULLETS format. "
+                    "(Showing first 600 chars)\n\n" + preview
+                )
+                raise ValueError(msg)
+
+            title = (m_title.group(1) or "").strip()
+            # Avoid generic or useless titles
             if title.lower() in ("chapter", "episode") or title.lower().startswith("chapter "):
-                title = _sanitize_llm_title(self._fallback_title())
+                title = self._fallback_title()
+            title = _sanitize_llm_title(title)
 
-            if not summary:
-                summary = text[:800].strip()
-            if not bullets:
-                bullets = "- " + "\n- ".join([x.strip() for x in text.splitlines() if x.strip()][:8])
+            summary = (m_sum.group(1) or "").strip()
+            bullets = (m_bul.group(1) or "").strip()
+            
 
+            # Normalize bullets to markdown list
+            blines = [ln.strip() for ln in bullets.splitlines() if ln.strip()]
+            if blines and not blines[0].startswith("-"):
+                bullets = "\n".join([("- " + ln.lstrip("- ").strip()) for ln in blines])
+            else:
+                bullets = "\n".join(blines)
 
             self.progress.emit(100)
             self.finished.emit(title, summary, bullets)
